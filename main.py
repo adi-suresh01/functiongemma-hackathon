@@ -1220,6 +1220,7 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
     primary_response = ""
     best_calls = []
     best_score = 0.0
+    graph_meta = {"ambiguity": 0.0, "avg_margin": 0.0, "low_margin_ratio": 0.0}
 
     model = cactus_init(functiongemma_path)
     try:
@@ -1269,6 +1270,45 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
                     bool(missing_likely) or
                     current_ambiguity >= recovery_ambiguity_threshold
                 )
+
+        if tools:
+            graph_calls, graph_meta_candidate = _graph_route_calls(user_text, tools, expected_calls)
+            graph_meta = graph_meta_candidate
+            if graph_calls:
+                graph_merged = _sanitize_calls(_merge_calls(best_calls, graph_calls), tools, user_text)
+                graph_merged = _trim_calls(
+                    graph_merged,
+                    tools,
+                    user_text,
+                    expected_calls,
+                    preferred_tools=likely_tools,
+                )
+                graph_score = _score_local_candidate(
+                    graph_merged,
+                    tools,
+                    user_text,
+                    local_confidence,
+                    primary_response,
+                )
+                graph_tool_names = {c.get("name") for c in graph_merged}
+                best_tool_names = {c.get("name") for c in best_calls}
+                graph_coverage_gain = len(graph_tool_names) > len(best_tool_names)
+                if graph_score > best_score or (graph_coverage_gain and graph_score >= best_score - 0.01):
+                    best_calls = graph_merged
+                    best_score = graph_score
+                    current_ambiguity = max(
+                        _ambiguity_score(user_text, tools, expected_calls, best_calls),
+                        graph_meta.get("ambiguity", 0.0),
+                    )
+                    best_tool_names = graph_tool_names
+                    missing_likely = likely_tools - best_tool_names
+                    need_clause_recovery = (
+                        len(best_calls) == 0 or
+                        len(best_calls) < expected_calls or
+                        best_score < 0.72 or
+                        bool(missing_likely) or
+                        current_ambiguity >= recovery_ambiguity_threshold
+                    )
 
         if need_clause_recovery and tools:
             focused_tools = _select_relevant_tools(user_text, tools, likely_tools=likely_tools, expected_calls=expected_calls)
@@ -1380,7 +1420,13 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
 
     best_tool_names = {c.get("name") for c in best_calls}
     missing_likely = likely_tools - best_tool_names
-    final_ambiguity = _ambiguity_score(user_text, tools, expected_calls, best_calls)
+    graph_ambiguity = graph_meta.get("ambiguity", 0.0)
+    graph_avg_margin = graph_meta.get("avg_margin", 0.0)
+    graph_low_margin_ratio = graph_meta.get("low_margin_ratio", 0.0)
+    final_ambiguity = max(
+        _ambiguity_score(user_text, tools, expected_calls, best_calls),
+        graph_ambiguity,
+    )
     risk = 0
     if len(best_calls) == 0:
         risk += 2
@@ -1398,6 +1444,10 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
         risk += 1
     if final_ambiguity >= cloud_ambiguity_high:
         risk += 1
+    if graph_low_margin_ratio >= 0.50:
+        risk += 1
+    if graph_avg_margin <= 0.8 and expected_calls >= 2:
+        risk += 1
     if local_confidence < min(0.85, confidence_threshold):
         risk += 1
     if _contains_refusal(primary_response) and not best_calls:
@@ -1407,6 +1457,8 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
     if final_ambiguity >= cloud_ambiguity_extreme and best_score < 0.90:
         cloud_pressure += 1
     if expected_calls >= 3 and best_score < 0.85:
+        cloud_pressure += 1
+    if graph_low_margin_ratio >= 0.67:
         cloud_pressure += 1
 
     local_bias = 0
@@ -1421,6 +1473,10 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
         local_bias += 1
     if len(tools) <= 2 and expected_calls == 1 and best_score >= 0.70:
         local_bias += 1
+    if graph_avg_margin >= 1.8 and not bool(missing_likely):
+        local_bias += 1
+    if graph_avg_margin >= 2.6 and best_score >= 0.85:
+        local_bias += 1
 
     route_score = cloud_pressure - local_bias
     cloud_threshold = 3
@@ -1428,6 +1484,11 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
         cloud_threshold = 2
     if final_ambiguity >= max(cloud_ambiguity_high, 0.70):
         cloud_threshold -= 1
+    if graph_avg_margin >= 2.4 and expected_calls <= 2:
+        cloud_threshold += 1
+    if graph_low_margin_ratio >= 0.75:
+        cloud_threshold -= 1
+    cloud_threshold = max(1, cloud_threshold)
 
     should_try_cloud = bool(os.environ.get("GEMINI_API_KEY")) and route_score >= cloud_threshold
     if should_try_cloud:
