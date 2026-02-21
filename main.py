@@ -1,12 +1,61 @@
-
 import sys
-sys.path.insert(0, "cactus/python/src")
-functiongemma_path = "cactus/weights/functiongemma-270m-it"
-
+from pathlib import Path
 import json, os, time
-from cactus import cactus_init, cactus_complete, cactus_destroy
-from google import genai
-from google.genai import types
+
+
+def _configure_cactus_import_path():
+    root = Path(__file__).resolve().parent
+    candidates = []
+
+    env_path = os.environ.get("CACTUS_PYTHON_SRC")
+    if env_path:
+        candidates.append(Path(env_path).expanduser())
+
+    candidates.extend([
+        root / "cactus" / "python" / "src",
+        root.parent / "cactus" / "python" / "src",
+    ])
+
+    for path in candidates:
+        if (path / "cactus.py").exists() or (path / "cactus").is_dir():
+            sys.path.insert(0, str(path))
+            return
+
+
+def _resolve_functiongemma_path():
+    root = Path(__file__).resolve().parent
+    candidates = []
+
+    env_path = os.environ.get("CACTUS_FUNCTIONGEMMA_PATH")
+    if env_path:
+        candidates.append(Path(env_path).expanduser())
+
+    candidates.extend([
+        root / "cactus" / "weights" / "functiongemma-270m-it",
+        root.parent / "cactus" / "weights" / "functiongemma-270m-it",
+    ])
+
+    for path in candidates:
+        if path.is_dir():
+            return str(path)
+
+    # Keep backward compatibility with original relative path.
+    return "cactus/weights/functiongemma-270m-it"
+
+
+_configure_cactus_import_path()
+functiongemma_path = _resolve_functiongemma_path()
+
+try:
+    from cactus import cactus_init, cactus_complete, cactus_destroy
+except ModuleNotFoundError as exc:
+    if exc.name != "cactus":
+        raise
+    raise ModuleNotFoundError(
+        "Could not import 'cactus'. Set CACTUS_PYTHON_SRC to your cactus/python/src path "
+        "(for example: /Users/adi/Desktop/cactus/python/src), or clone cactus into "
+        "./cactus inside this repo."
+    ) from exc
 
 
 def generate_cactus(messages, tools):
@@ -47,7 +96,20 @@ def generate_cactus(messages, tools):
 
 def generate_cloud(messages, tools):
     """Run function calling via Gemini Cloud API."""
-    client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+    try:
+        from google import genai
+        from google.genai import types
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "Cloud fallback requires the `google-genai` package. "
+            "Install it with: pip install google-genai"
+        ) from exc
+
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        raise RuntimeError("Cloud fallback requires GEMINI_API_KEY to be set.")
+
+    client = genai.Client(api_key=api_key)
 
     gemini_tools = [
         types.Tool(function_declarations=[
@@ -102,7 +164,14 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
         local["source"] = "on-device"
         return local
 
-    cloud = generate_cloud(messages, tools)
+    try:
+        cloud = generate_cloud(messages, tools)
+    except Exception as exc:
+        # Keep benchmark execution alive in offline/local-only setups.
+        local["source"] = "on-device"
+        local["cloud_error"] = str(exc)
+        return local
+
     cloud["source"] = "cloud (fallback)"
     cloud["local_confidence"] = local["confidence"]
     cloud["total_time_ms"] += local["total_time_ms"]
