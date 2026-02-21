@@ -461,6 +461,17 @@ def _coerce_argument(value, arg_type, key, user_text):
         inferred = _extract_string_for_key(key_l, "", user_text)
         return inferred if inferred is not None else ""
 
+    if key_l == "time":
+        value_s = str(value).strip()
+        normalized = _extract_time_text(value_s)
+        if normalized:
+            return normalized
+        # Reject malformed clock values (for example: 29:00) and recover from user text when possible.
+        if re.search(r"\b\d{1,2}:\d{2}\b", value_s):
+            inferred = _extract_time_text(user_text)
+            return inferred if inferred is not None else None
+        return value_s
+
     return str(value).strip()
 
 
@@ -629,8 +640,7 @@ def _choose_clause_tools(clause, tools, max_tools=6):
     return positive[:max_tools]
 
 
-def _run_local_candidate(messages, tools, system_prompt=None, tool_rag_top_k=0):
-    model = cactus_init(functiongemma_path)
+def _run_local_candidate_with_model(model, messages, tools, system_prompt=None, tool_rag_top_k=0, max_tokens=256):
     cactus_tools = [{"type": "function", "function": t} for t in tools]
     if not system_prompt:
         system_prompt = "You are a helpful assistant that can use tools."
@@ -638,7 +648,7 @@ def _run_local_candidate(messages, tools, system_prompt=None, tool_rag_top_k=0):
     kwargs = {
         "tools": cactus_tools,
         "force_tools": True,
-        "max_tokens": 256,
+        "max_tokens": max_tokens,
         "stop_sequences": ["<|im_end|>", "<end_of_turn>"],
         "tool_rag_top_k": tool_rag_top_k,
     }
@@ -655,8 +665,6 @@ def _run_local_candidate(messages, tools, system_prompt=None, tool_rag_top_k=0):
             [{"role": "system", "content": system_prompt}] + messages,
             **kwargs,
         )
-    finally:
-        cactus_destroy(model)
 
     try:
         raw = json.loads(raw_str)
@@ -674,6 +682,21 @@ def _run_local_candidate(messages, tools, system_prompt=None, tool_rag_top_k=0):
         "confidence": raw.get("confidence", 0),
         "response": raw.get("response", ""),
     }
+
+
+def _run_local_candidate(messages, tools, system_prompt=None, tool_rag_top_k=0, max_tokens=256):
+    model = cactus_init(functiongemma_path)
+    try:
+        return _run_local_candidate_with_model(
+            model,
+            messages,
+            tools,
+            system_prompt=system_prompt,
+            tool_rag_top_k=tool_rag_top_k,
+            max_tokens=max_tokens,
+        )
+    finally:
+        cactus_destroy(model)
 
 
 def _merge_calls(primary_calls, extra_calls):
@@ -749,6 +772,20 @@ def _likely_tool_names(user_text, tools):
     return {name for name, score in scored if score >= threshold and score > 0}
 
 
+def _likely_tools_with_clauses(user_text, tools):
+    likely = set(_likely_tool_names(user_text, tools))
+    for clause in _split_clauses(user_text):
+        scored = sorted(((tool["name"], _tool_relevance(tool, clause)) for tool in tools), key=lambda x: x[1], reverse=True)
+        if not scored or scored[0][1] <= 0:
+            continue
+        top_name, top_score = scored[0]
+        likely.add(top_name)
+        # Keep second-best when it is close to top relevance.
+        if len(scored) > 1 and scored[1][1] >= max(1, top_score - 1):
+            likely.add(scored[1][0])
+    return likely
+
+
 def _call_quality(call, tools_by_name, user_text):
     name = call.get("name")
     if name not in tools_by_name:
@@ -798,11 +835,16 @@ def _trim_calls(calls, tools, user_text, max_calls, preferred_tools=None):
     selected = []
     selected_keys = set()
 
-    # First, ensure preferred tools are represented when possible.
+    # First, ensure preferred tools are represented when possible (deterministic order).
+    preferred_ranked = []
     for tool_name in preferred:
         call = best_per_tool.get(tool_name)
-        if not call or len(selected) >= max_calls:
-            continue
+        if call:
+            preferred_ranked.append(call)
+    preferred_ranked.sort(key=lambda c: _call_quality(c, tools_by_name, user_text), reverse=True)
+    for call in preferred_ranked:
+        if len(selected) >= max_calls:
+            break
         key = (call.get("name"), json.dumps(call.get("arguments", {}), sort_keys=True, ensure_ascii=False))
         if key in selected_keys:
             continue
@@ -904,80 +946,105 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
     """
     user_text = _extract_user_text(messages)
     expected_calls = _estimate_intent_count(user_text, tools)
-    likely_tools = _likely_tool_names(user_text, tools)
+    likely_tools = _likely_tools_with_clauses(user_text, tools)
 
-    primary = _run_local_candidate(messages, tools, tool_rag_top_k=0)
-    total_local_time = primary.get("total_time_ms", 0) or 0
-    local_confidence = float(primary.get("confidence", 0) or 0)
-    primary_response = primary.get("response", "")
+    total_local_time = 0
+    local_confidence = 0.0
+    primary_response = ""
+    best_calls = []
+    best_score = 0.0
 
-    repaired_primary_calls = _sanitize_calls(primary.get("function_calls", []), tools, user_text)
-    best_calls = _trim_calls(repaired_primary_calls, tools, user_text, expected_calls, preferred_tools=likely_tools)
-    best_score = _score_local_candidate(best_calls, tools, user_text, local_confidence, primary_response)
-    best_tool_names = {c.get("name") for c in best_calls}
-    missing_likely = likely_tools - best_tool_names
-
-    need_clause_recovery = (
-        len(best_calls) == 0 or
-        len(best_calls) < expected_calls or
-        best_score < 0.72 or
-        bool(missing_likely)
-    )
-
-    if need_clause_recovery and tools:
-        quick_synth = _sanitize_calls(_synthesize_calls_from_text(user_text, tools), tools, user_text)
-        quick_merged = _sanitize_calls(_merge_calls(best_calls, quick_synth), tools, user_text)
-        quick_merged = _trim_calls(quick_merged, tools, user_text, expected_calls, preferred_tools=likely_tools)
-        quick_score = _score_local_candidate(quick_merged, tools, user_text, local_confidence, "")
-        if quick_score >= best_score:
-            best_calls = quick_merged
-            best_score = quick_score
-            best_tool_names = {c.get("name") for c in best_calls}
-            missing_likely = likely_tools - best_tool_names
-            need_clause_recovery = (
-                len(best_calls) == 0 or
-                len(best_calls) < expected_calls or
-                best_score < 0.72 or
-                bool(missing_likely)
-            )
-
-    if need_clause_recovery and tools:
-        clause_calls = []
-        for clause in _split_clauses(user_text)[:4]:
-            clause_tools = _choose_clause_tools(clause, tools)
-            clause_messages = [{"role": "user", "content": clause}]
-            clause_result = _run_local_candidate(clause_messages, clause_tools, tool_rag_top_k=0)
-            total_local_time += clause_result.get("total_time_ms", 0) or 0
-            clause_fixed = _sanitize_calls(clause_result.get("function_calls", []), clause_tools, clause)
-            clause_synth = _sanitize_calls(_synthesize_calls_from_text(clause, clause_tools), clause_tools, clause)
-            clause_candidates = _sanitize_calls(_merge_calls(clause_fixed, clause_synth), clause_tools, clause)
-            if clause_candidates:
-                # Each clause should usually map to one primary tool call.
-                clause_calls.append(clause_candidates[0])
-
-        merged_calls = _sanitize_calls(_merge_calls(best_calls, clause_calls), tools, user_text)
-        merged_calls = _trim_calls(merged_calls, tools, user_text, expected_calls, preferred_tools=likely_tools)
-        merged_score = _score_local_candidate(
-            merged_calls,
+    model = cactus_init(functiongemma_path)
+    try:
+        primary_max_tokens = 192 if expected_calls <= 2 else 256
+        primary = _run_local_candidate_with_model(
+            model,
+            messages,
             tools,
-            user_text,
-            local_confidence,
-            primary_response,
+            tool_rag_top_k=0,
+            max_tokens=primary_max_tokens,
         )
-        if merged_score > best_score:
-            best_calls = merged_calls
-            best_score = merged_score
+        total_local_time += primary.get("total_time_ms", 0) or 0
+        local_confidence = float(primary.get("confidence", 0) or 0)
+        primary_response = primary.get("response", "")
 
-    best_tool_names = {c.get("name") for c in best_calls}
-    missing_likely = likely_tools - best_tool_names
-    if (len(best_calls) < expected_calls or best_score < 0.55 or bool(missing_likely)) and tools:
-        synthesized = _sanitize_calls(_synthesize_calls_from_text(user_text, tools), tools, user_text)
-        merged_synth = _sanitize_calls(_merge_calls(best_calls, synthesized), tools, user_text)
-        merged_synth = _trim_calls(merged_synth, tools, user_text, expected_calls, preferred_tools=likely_tools)
-        synth_score = _score_local_candidate(merged_synth, tools, user_text, local_confidence, "")
-        if synth_score >= best_score:
-            best_calls = merged_synth
-            best_score = synth_score
+        repaired_primary_calls = _sanitize_calls(primary.get("function_calls", []), tools, user_text)
+        best_calls = _trim_calls(repaired_primary_calls, tools, user_text, expected_calls, preferred_tools=likely_tools)
+        best_score = _score_local_candidate(best_calls, tools, user_text, local_confidence, primary_response)
+        best_tool_names = {c.get("name") for c in best_calls}
+        missing_likely = likely_tools - best_tool_names
+
+        need_clause_recovery = (
+            len(best_calls) == 0 or
+            len(best_calls) < expected_calls or
+            best_score < 0.72 or
+            bool(missing_likely)
+        )
+
+        if need_clause_recovery and tools:
+            # Run deterministic synthesis before expensive extra local passes.
+            quick_synth = _sanitize_calls(_synthesize_calls_from_text(user_text, tools), tools, user_text)
+            quick_merged = _sanitize_calls(_merge_calls(best_calls, quick_synth), tools, user_text)
+            quick_merged = _trim_calls(quick_merged, tools, user_text, expected_calls, preferred_tools=likely_tools)
+            quick_score = _score_local_candidate(quick_merged, tools, user_text, local_confidence, "")
+            if quick_score >= best_score:
+                best_calls = quick_merged
+                best_score = quick_score
+                best_tool_names = {c.get("name") for c in best_calls}
+                missing_likely = likely_tools - best_tool_names
+                need_clause_recovery = (
+                    len(best_calls) == 0 or
+                    len(best_calls) < expected_calls or
+                    best_score < 0.72 or
+                    bool(missing_likely)
+                )
+
+        if need_clause_recovery and tools:
+            clause_calls = []
+            clause_limit = min(4, max(2, expected_calls + 1))
+            for clause in _split_clauses(user_text)[:clause_limit]:
+                clause_tools = _choose_clause_tools(clause, tools)
+                clause_messages = [{"role": "user", "content": clause}]
+                clause_result = _run_local_candidate_with_model(
+                    model,
+                    clause_messages,
+                    clause_tools,
+                    tool_rag_top_k=0,
+                    max_tokens=96,
+                )
+                total_local_time += clause_result.get("total_time_ms", 0) or 0
+                clause_fixed = _sanitize_calls(clause_result.get("function_calls", []), clause_tools, clause)
+                clause_synth = _sanitize_calls(_synthesize_calls_from_text(clause, clause_tools), clause_tools, clause)
+                clause_candidates = _sanitize_calls(_merge_calls(clause_fixed, clause_synth), clause_tools, clause)
+                if clause_candidates:
+                    # Each clause should usually map to one primary tool call.
+                    clause_calls.append(clause_candidates[0])
+
+            merged_calls = _sanitize_calls(_merge_calls(best_calls, clause_calls), tools, user_text)
+            merged_calls = _trim_calls(merged_calls, tools, user_text, expected_calls, preferred_tools=likely_tools)
+            merged_score = _score_local_candidate(
+                merged_calls,
+                tools,
+                user_text,
+                local_confidence,
+                primary_response,
+            )
+            if merged_score > best_score:
+                best_calls = merged_calls
+                best_score = merged_score
+
+        best_tool_names = {c.get("name") for c in best_calls}
+        missing_likely = likely_tools - best_tool_names
+        if (len(best_calls) < expected_calls or best_score < 0.55 or bool(missing_likely)) and tools:
+            synthesized = _sanitize_calls(_synthesize_calls_from_text(user_text, tools), tools, user_text)
+            merged_synth = _sanitize_calls(_merge_calls(best_calls, synthesized), tools, user_text)
+            merged_synth = _trim_calls(merged_synth, tools, user_text, expected_calls, preferred_tools=likely_tools)
+            synth_score = _score_local_candidate(merged_synth, tools, user_text, local_confidence, "")
+            if synth_score >= best_score:
+                best_calls = merged_synth
+                best_score = synth_score
+    finally:
+        cactus_destroy(model)
 
     local = {
         "function_calls": best_calls,
@@ -985,6 +1052,8 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
         "confidence": local_confidence,
     }
 
+    best_tool_names = {c.get("name") for c in best_calls}
+    missing_likely = likely_tools - best_tool_names
     risk = 0
     if len(best_calls) == 0:
         risk += 2
@@ -992,6 +1061,12 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
         risk += 1
     if best_score < 0.45:
         risk += 2
+    if best_score < 0.70 and expected_calls >= 2:
+        risk += 1
+    if len(tools) >= 8 and best_score < 0.80:
+        risk += 1
+    if bool(missing_likely):
+        risk += 1
     if local_confidence < min(0.85, confidence_threshold):
         risk += 1
     if _contains_refusal(primary_response) and not best_calls:
