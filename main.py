@@ -258,9 +258,6 @@ def _extract_time_tuple(text):
         am_pm = match.group(3).lower()
         if am_pm == "am" and hour == 12:
             hour = 0
-        elif am_pm == "pm" and hour != 12:
-            # Keep 24h integer representation for numeric fields.
-            hour += 12
         return hour, minute
 
     match = re.search(r"\b([01]?\d|2[0-3]):([0-5]\d)\b", text)
@@ -283,6 +280,18 @@ def _extract_time_text(text):
         return f"{int(match.group(1))}:{int(match.group(2)):02d}"
 
     return None
+
+
+def _extract_all_time_texts(text):
+    times = []
+    for match in re.finditer(r"\b(\d{1,2})(?::([0-5]\d))?\s*(AM|PM)\b", text, flags=re.IGNORECASE):
+        hour = int(match.group(1))
+        minute = int(match.group(2) or 0)
+        am_pm = match.group(3).upper()
+        times.append(f"{hour}:{minute:02d} {am_pm}")
+    for match in re.finditer(r"\b([01]?\d|2[0-3]):([0-5]\d)\b", text):
+        times.append(f"{int(match.group(1))}:{int(match.group(2)):02d}")
+    return times
 
 
 def _extract_int_for_key(key, text):
@@ -327,6 +336,7 @@ def _extract_string_for_key(key, call_name, text):
     if key_l in {"recipient", "contact", "query", "name", "person"}:
         patterns = [
             r"(?:message|text|send(?:\s+a)?\s+message)\s+to\s+([a-z][a-z' \-]+?)(?:\s+saying\b|[,.!?]|$|\band\b)",
+            r"\btext\s+([a-z][a-z' \-]+?)(?:\s+saying\b|[,.!?]|$|\band\b)",
             r"(?:find|look up|search(?: for)?)\s+([a-z][a-z' \-]+?)(?:\s+in\b|[,.!?]|$|\band\b)",
             r"\bto\s+([a-z][a-z' \-]+?)(?:\s+saying\b|[,.!?]|$|\band\b)",
         ]
@@ -349,7 +359,8 @@ def _extract_string_for_key(key, call_name, text):
 
     if key_l in {"song", "music", "track", "playlist"}:
         patterns = [
-            r"\bplay\s+(?:some\s+)?(.+?)(?:\s+music\b|[,.!?]|$|\band\b)",
+            r"\bplay\s+some\s+(.+?)\s+music(?:[,.!?]|$|\band\b)",
+            r"\bplay\s+(?:some\s+)?(.+?)(?:[,.!?]|$|\band\b)",
             r"\blisten to\s+(.+?)(?:[,.!?]|$|\band\b)",
         ]
         for pattern in patterns:
@@ -361,7 +372,9 @@ def _extract_string_for_key(key, call_name, text):
         pattern = r"\bremind me(?:\s+to|\s+about)?\s+(.+?)(?:\s+at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)\b|[,.!?]|$|\band\b)"
         match = re.search(pattern, text, flags=re.IGNORECASE)
         if match:
-            return _clean_span(match.group(1))
+            title = _clean_span(match.group(1))
+            title = re.sub(r"^\b(the|a|an)\b\s+", "", title, flags=re.IGNORECASE)
+            return _clean_span(title)
 
     if key_l in {"time", "when", "datetime"}:
         return _extract_time_text(text)
@@ -494,6 +507,43 @@ def _sanitize_calls(calls, tools, user_text):
             parsed_time = _extract_time_tuple(user_text)
             if parsed_time:
                 args["hour"], args["minute"] = parsed_time
+
+        # Prefer user-grounded values for common ambiguous slots.
+        for key, schema in properties.items():
+            if key not in args:
+                continue
+            key_l = key.lower()
+            expected_type = schema.get("type", "string") if isinstance(schema, dict) else "string"
+            if expected_type == "integer" and key_l in {"hour", "minute", "minutes"}:
+                inferred_int = _extract_int_for_key(key_l, user_text)
+                if inferred_int is not None:
+                    args[key] = _coerce_argument(inferred_int, "integer", key_l, user_text)
+            if expected_type == "string" and key_l in {"location", "recipient", "query", "song", "title", "message", "time"}:
+                inferred_str = _extract_string_for_key(key_l, name, user_text)
+                if inferred_str:
+                    current_val = str(args.get(key, ""))
+                    inferred_clean = _clean_span(inferred_str)
+                    if key_l == "time":
+                        current_clean = _clean_span(current_val)
+                        suspicious_time = (
+                            not current_clean or
+                            re.search(r"\d{4}-\d{2}-\d{2}", current_clean) is not None or
+                            re.search(r"\d{1,2}h\d{2}", current_clean.lower()) is not None
+                        )
+                        time_mentions = _extract_all_time_texts(user_text)
+                        if suspicious_time or len(time_mentions) == 1:
+                            args[key] = inferred_clean
+                        continue
+                    # Override suspicious generated values with grounded values from user text.
+                    suspicious = (
+                        not current_val or
+                        "@" in current_val or
+                        "t" in current_val.lower() and re.search(r"\d{4}-\d{2}-\d{2}", current_val) is not None or
+                        (key_l == "title" and inferred_clean.lower() in user_text.lower()) or
+                        inferred_clean.lower() not in user_text.lower()
+                    )
+                    if suspicious:
+                        args[key] = inferred_clean
 
         missing = [k for k in required if k not in args or args[k] in ("", None)]
         if missing:
@@ -690,34 +740,137 @@ def _score_local_candidate(calls, tools, user_text, confidence=0.0, response="")
     return max(0.0, min(1.0, score))
 
 
+def _likely_tool_names(user_text, tools):
+    if not tools:
+        return set()
+    scored = [(tool["name"], _tool_relevance(tool, user_text)) for tool in tools]
+    top = max(score for _, score in scored)
+    threshold = max(2, top - 2)
+    return {name for name, score in scored if score >= threshold and score > 0}
+
+
+def _call_quality(call, tools_by_name, user_text):
+    name = call.get("name")
+    if name not in tools_by_name:
+        return -1e9
+
+    tool = tools_by_name[name]
+    properties, required = _tool_schema(tool)
+    args = call.get("arguments", {})
+    if not isinstance(args, dict):
+        args = {}
+
+    score = float(_tool_relevance(tool, user_text))
+    if required:
+        present = sum(1 for req in required if req in args and args[req] not in ("", None))
+        score += 3.0 * (present / len(required))
+
+    for key, value in args.items():
+        value_s = _clean_span(value)
+        value_l = value_s.lower()
+        if value_s and value_l in user_text.lower():
+            score += 1.5
+        if key.lower() == "time":
+            expected_time = _extract_time_text(user_text)
+            if expected_time and value_s.lower() == expected_time.lower():
+                score += 2.0
+        if "@" in value_s or re.search(r"\d{4}-\d{2}-\d{2}", value_s):
+            score -= 2.0
+
+    return score
+
+
+def _trim_calls(calls, tools, user_text, max_calls, preferred_tools=None):
+    if max_calls <= 0 or len(calls) <= max_calls:
+        return calls
+
+    tools_by_name = {t["name"]: t for t in tools}
+    preferred = set(preferred_tools or [])
+
+    ranked = sorted(calls, key=lambda c: _call_quality(c, tools_by_name, user_text), reverse=True)
+
+    best_per_tool = {}
+    for call in ranked:
+        name = call.get("name")
+        if name not in best_per_tool:
+            best_per_tool[name] = call
+
+    selected = []
+    selected_keys = set()
+
+    # First, ensure preferred tools are represented when possible.
+    for tool_name in preferred:
+        call = best_per_tool.get(tool_name)
+        if not call or len(selected) >= max_calls:
+            continue
+        key = (call.get("name"), json.dumps(call.get("arguments", {}), sort_keys=True, ensure_ascii=False))
+        if key in selected_keys:
+            continue
+        selected.append(call)
+        selected_keys.add(key)
+
+    # Next, add best distinct tools to improve intent coverage.
+    distinct_ranked = sorted(best_per_tool.values(), key=lambda c: _call_quality(c, tools_by_name, user_text), reverse=True)
+    for call in distinct_ranked:
+        if len(selected) >= max_calls:
+            break
+        key = (call.get("name"), json.dumps(call.get("arguments", {}), sort_keys=True, ensure_ascii=False))
+        if key in selected_keys:
+            continue
+        selected.append(call)
+        selected_keys.add(key)
+
+    # Finally, if still short, allow duplicates by raw quality.
+    for call in ranked:
+        if len(selected) >= max_calls:
+            break
+        key = (call.get("name"), json.dumps(call.get("arguments", {}), sort_keys=True, ensure_ascii=False))
+        if key in selected_keys:
+            continue
+        selected.append(call)
+        selected_keys.add(key)
+
+    return selected
+
+
 def _synthesize_calls_from_text(user_text, tools):
     if not user_text or not tools:
         return []
 
     synthesized = []
     clauses = _split_clauses(user_text)
+    last_person = None
     for clause in clauses:
         ranked = sorted(((tool, _tool_relevance(tool, clause)) for tool in tools), key=lambda x: x[1], reverse=True)
         if not ranked or ranked[0][1] <= 0:
             continue
-        tool = ranked[0][0]
-        properties, required = _tool_schema(tool)
-        args = {}
-        for req in required:
-            arg_type = properties.get(req, {}).get("type", "string")
-            value = _infer_argument(req, arg_type, clause, tool.get("name", ""))
-            if value is None:
-                value = _infer_argument(req, arg_type, user_text, tool.get("name", ""))
-            if value is None:
-                args = None
+        for tool, score in ranked:
+            if score <= 0:
                 break
-            coerced = _coerce_argument(value, arg_type, req, user_text)
-            if coerced is None or coerced == "":
-                args = None
+            properties, required = _tool_schema(tool)
+            args = {}
+            for req in required:
+                arg_type = properties.get(req, {}).get("type", "string")
+                value = _infer_argument(req, arg_type, clause, tool.get("name", ""))
+                if value is None:
+                    value = _infer_argument(req, arg_type, user_text, tool.get("name", ""))
+                if value is None and req.lower() in {"recipient", "contact", "query", "name", "person"} and last_person:
+                    value = last_person
+                if value is None:
+                    args = None
+                    break
+                coerced = _coerce_argument(value, arg_type, req, user_text)
+                if coerced is None or coerced == "":
+                    args = None
+                    break
+                args[req] = coerced
+            if args:
+                for req, coerced in args.items():
+                    if req.lower() in {"recipient", "contact", "query", "name", "person"}:
+                        if isinstance(coerced, str) and coerced.lower() not in {"him", "her", "them"}:
+                            last_person = coerced
+                synthesized.append({"name": tool["name"], "arguments": args})
                 break
-            args[req] = coerced
-        if args:
-            synthesized.append({"name": tool["name"], "arguments": args})
 
     if not synthesized:
         ranked = sorted(((tool, _tool_relevance(tool, user_text)) for tool in tools), key=lambda x: x[1], reverse=True)
@@ -728,6 +881,8 @@ def _synthesize_calls_from_text(user_text, tools):
             for req in required:
                 arg_type = properties.get(req, {}).get("type", "string")
                 value = _infer_argument(req, arg_type, user_text, tool.get("name", ""))
+                if value is None and req.lower() in {"recipient", "contact", "query", "name", "person"} and last_person:
+                    value = last_person
                 if value is None:
                     args = None
                     break
@@ -749,6 +904,7 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
     """
     user_text = _extract_user_text(messages)
     expected_calls = _estimate_intent_count(user_text, tools)
+    likely_tools = _likely_tool_names(user_text, tools)
 
     primary = _run_local_candidate(messages, tools, tool_rag_top_k=0)
     total_local_time = primary.get("total_time_ms", 0) or 0
@@ -756,14 +912,35 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
     primary_response = primary.get("response", "")
 
     repaired_primary_calls = _sanitize_calls(primary.get("function_calls", []), tools, user_text)
-    best_calls = repaired_primary_calls
+    best_calls = _trim_calls(repaired_primary_calls, tools, user_text, expected_calls, preferred_tools=likely_tools)
     best_score = _score_local_candidate(best_calls, tools, user_text, local_confidence, primary_response)
+    best_tool_names = {c.get("name") for c in best_calls}
+    missing_likely = likely_tools - best_tool_names
 
     need_clause_recovery = (
         len(best_calls) == 0 or
         len(best_calls) < expected_calls or
-        best_score < 0.72
+        best_score < 0.72 or
+        bool(missing_likely)
     )
+
+    if need_clause_recovery and tools:
+        quick_synth = _sanitize_calls(_synthesize_calls_from_text(user_text, tools), tools, user_text)
+        quick_merged = _sanitize_calls(_merge_calls(best_calls, quick_synth), tools, user_text)
+        quick_merged = _trim_calls(quick_merged, tools, user_text, expected_calls, preferred_tools=likely_tools)
+        quick_score = _score_local_candidate(quick_merged, tools, user_text, local_confidence, "")
+        if quick_score >= best_score:
+            best_calls = quick_merged
+            best_score = quick_score
+            best_tool_names = {c.get("name") for c in best_calls}
+            missing_likely = likely_tools - best_tool_names
+            need_clause_recovery = (
+                len(best_calls) == 0 or
+                len(best_calls) < expected_calls or
+                best_score < 0.72 or
+                bool(missing_likely)
+            )
+
     if need_clause_recovery and tools:
         clause_calls = []
         for clause in _split_clauses(user_text)[:4]:
@@ -772,11 +949,20 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
             clause_result = _run_local_candidate(clause_messages, clause_tools, tool_rag_top_k=0)
             total_local_time += clause_result.get("total_time_ms", 0) or 0
             clause_fixed = _sanitize_calls(clause_result.get("function_calls", []), clause_tools, clause)
-            if clause_fixed:
+            clause_synth = _sanitize_calls(_synthesize_calls_from_text(clause, clause_tools), clause_tools, clause)
+            clause_candidates = _sanitize_calls(_merge_calls(clause_fixed, clause_synth), clause_tools, clause)
+            if clause_candidates:
                 # Each clause should usually map to one primary tool call.
-                clause_calls.append(clause_fixed[0])
+                clause_calls.append(clause_candidates[0])
+
+            tentative_calls = _sanitize_calls(_merge_calls(best_calls, clause_calls), tools, user_text)
+            tentative_calls = _trim_calls(tentative_calls, tools, user_text, expected_calls, preferred_tools=likely_tools)
+            tentative_tools = {c.get("name") for c in tentative_calls}
+            if len(tentative_calls) >= expected_calls and likely_tools.issubset(tentative_tools):
+                break
 
         merged_calls = _sanitize_calls(_merge_calls(best_calls, clause_calls), tools, user_text)
+        merged_calls = _trim_calls(merged_calls, tools, user_text, expected_calls, preferred_tools=likely_tools)
         merged_score = _score_local_candidate(
             merged_calls,
             tools,
@@ -788,11 +974,15 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
             best_calls = merged_calls
             best_score = merged_score
 
-    if (not best_calls or best_score < 0.55) and tools:
+    best_tool_names = {c.get("name") for c in best_calls}
+    missing_likely = likely_tools - best_tool_names
+    if (len(best_calls) < expected_calls or best_score < 0.55 or bool(missing_likely)) and tools:
         synthesized = _sanitize_calls(_synthesize_calls_from_text(user_text, tools), tools, user_text)
-        synth_score = _score_local_candidate(synthesized, tools, user_text, local_confidence, "")
+        merged_synth = _sanitize_calls(_merge_calls(best_calls, synthesized), tools, user_text)
+        merged_synth = _trim_calls(merged_synth, tools, user_text, expected_calls, preferred_tools=likely_tools)
+        synth_score = _score_local_candidate(merged_synth, tools, user_text, local_confidence, "")
         if synth_score >= best_score:
-            best_calls = synthesized
+            best_calls = merged_synth
             best_score = synth_score
 
     local = {
