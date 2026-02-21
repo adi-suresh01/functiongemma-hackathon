@@ -786,6 +786,44 @@ def _likely_tools_with_clauses(user_text, tools):
     return likely
 
 
+def _select_relevant_tools(user_text, tools, likely_tools=None, expected_calls=1):
+    if not tools:
+        return []
+    if len(tools) <= 3:
+        return tools
+
+    likely_set = set(likely_tools or [])
+    ranked = sorted(((tool, _tool_relevance(tool, user_text)) for tool in tools), key=lambda x: x[1], reverse=True)
+    top_score = ranked[0][1] if ranked else 0
+
+    keep_names = set()
+    for tool, score in ranked:
+        name = tool.get("name")
+        if name in likely_set:
+            keep_names.add(name)
+            continue
+        if top_score > 0 and score >= max(1, top_score - 2):
+            keep_names.add(name)
+
+    min_keep = min(len(tools), max(3, expected_calls + 1))
+    max_keep = min(len(tools), max(6, expected_calls + 3))
+
+    for tool, _ in ranked:
+        if len(keep_names) >= min_keep:
+            break
+        keep_names.add(tool.get("name"))
+
+    selected = [tool for tool in tools if tool.get("name") in keep_names]
+
+    if len(selected) > max_keep:
+        top_names = set()
+        for tool, _ in ranked[:max_keep]:
+            top_names.add(tool.get("name"))
+        selected = [tool for tool in tools if tool.get("name") in top_names]
+
+    return selected if selected else tools
+
+
 def _sorted_tool_scores(text, tools):
     return sorted(
         ((tool["name"], _tool_relevance(tool, text)) for tool in tools),
@@ -1111,6 +1149,54 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
                     bool(missing_likely) or
                     current_ambiguity >= recovery_ambiguity_threshold
                 )
+
+        if need_clause_recovery and tools:
+            focused_tools = _select_relevant_tools(user_text, tools, likely_tools=likely_tools, expected_calls=expected_calls)
+            if len(focused_tools) < len(tools):
+                focused_result = _run_local_candidate_with_model(
+                    model,
+                    messages,
+                    focused_tools,
+                    system_prompt=(
+                        "You are a precise tool-calling assistant. "
+                        "Use only the provided tools and return all needed function calls."
+                    ),
+                    tool_rag_top_k=0,
+                    max_tokens=160,
+                )
+                total_local_time += focused_result.get("total_time_ms", 0) or 0
+                focused_calls = _sanitize_calls(focused_result.get("function_calls", []), focused_tools, user_text)
+                focused_merged = _sanitize_calls(_merge_calls(best_calls, focused_calls), tools, user_text)
+                focused_merged = _trim_calls(
+                    focused_merged,
+                    tools,
+                    user_text,
+                    expected_calls,
+                    preferred_tools=likely_tools,
+                )
+                focused_score = _score_local_candidate(
+                    focused_merged,
+                    tools,
+                    user_text,
+                    local_confidence,
+                    focused_result.get("response", ""),
+                )
+                focused_tool_names = {c.get("name") for c in focused_merged}
+                best_tool_names = {c.get("name") for c in best_calls}
+                improved_coverage = len(focused_tool_names) > len(best_tool_names)
+                if focused_score > best_score or (improved_coverage and focused_score >= best_score - 0.02):
+                    best_calls = focused_merged
+                    best_score = focused_score
+                    current_ambiguity = _ambiguity_score(user_text, tools, expected_calls, best_calls)
+                    best_tool_names = focused_tool_names
+                    missing_likely = likely_tools - best_tool_names
+                    need_clause_recovery = (
+                        len(best_calls) == 0 or
+                        len(best_calls) < expected_calls or
+                        best_score < 0.72 or
+                        bool(missing_likely) or
+                        current_ambiguity >= recovery_ambiguity_threshold
+                    )
 
         if need_clause_recovery and tools:
             clause_calls = []
