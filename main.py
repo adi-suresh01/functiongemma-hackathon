@@ -955,12 +955,6 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
                 # Each clause should usually map to one primary tool call.
                 clause_calls.append(clause_candidates[0])
 
-            tentative_calls = _sanitize_calls(_merge_calls(best_calls, clause_calls), tools, user_text)
-            tentative_calls = _trim_calls(tentative_calls, tools, user_text, expected_calls, preferred_tools=likely_tools)
-            tentative_tools = {c.get("name") for c in tentative_calls}
-            if len(tentative_calls) >= expected_calls and likely_tools.issubset(tentative_tools):
-                break
-
         merged_calls = _sanitize_calls(_merge_calls(best_calls, clause_calls), tools, user_text)
         merged_calls = _trim_calls(merged_calls, tools, user_text, expected_calls, preferred_tools=likely_tools)
         merged_score = _score_local_candidate(
