@@ -1214,6 +1214,7 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
     cloud_ambiguity_low = 0.35
     cloud_ambiguity_high = 0.60
     cloud_ambiguity_extreme = 0.75
+    cloud_accept_margin = 0.0
     local_time_budget_ms = 700
     min_budget_for_extra_pass_ms = 120
     clause_pass_budget_estimate_ms = 130
@@ -1488,46 +1489,48 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
         cloud_pressure += 1
 
     local_bias = 0
-    if best_score >= 0.92 and len(best_calls) >= expected_calls:
-        local_bias += 2
-    elif best_score >= 0.82:
+    if best_score >= 0.94 and len(best_calls) >= expected_calls and final_ambiguity < 0.45:
         local_bias += 1
-    if local_confidence >= 0.95:
+    elif best_score >= 0.86 and final_ambiguity < 0.35:
+        local_bias += 1
+    if local_confidence >= 0.98 and final_ambiguity < 0.35:
         local_bias += 1
     if total_local_time >= local_time_budget_ms:
-        local_bias += 2
+        local_bias += 1
     elif total_local_time >= 500:
         # Cloud fallback here is usually net-latency-negative.
         local_bias += 1
-    if len(tools) <= 2 and expected_calls == 1 and best_score >= 0.70:
+    if len(tools) <= 2 and expected_calls == 1 and best_score >= 0.78 and final_ambiguity < 0.35:
         local_bias += 1
     if graph_avg_margin >= 1.8 and not bool(missing_likely):
         local_bias += 1
-    if graph_avg_margin >= 2.6 and best_score >= 0.85:
+    if graph_avg_margin >= 2.6 and best_score >= 0.90:
         local_bias += 1
 
     route_score = cloud_pressure - local_bias
-    cloud_threshold = 3
+    cloud_threshold = 2
     if expected_calls >= 3 or len(tools) >= 8:
-        cloud_threshold = 2
+        cloud_threshold = 1
     if final_ambiguity >= max(cloud_ambiguity_high, 0.70):
         cloud_threshold -= 1
     if graph_avg_margin >= 2.4 and expected_calls <= 2:
         cloud_threshold += 1
     if graph_low_margin_ratio >= 0.75:
         cloud_threshold -= 1
+    if bool(missing_likely):
+        cloud_threshold -= 1
+    if len(best_calls) < expected_calls:
+        cloud_threshold -= 1
+    if best_score < 0.75:
+        cloud_threshold -= 1
     cloud_threshold = max(1, cloud_threshold)
 
     should_try_cloud = bool(os.environ.get("GEMINI_API_KEY")) and route_score >= cloud_threshold
-    if (
-        should_try_cloud and
-        total_local_time >= local_time_budget_ms and
-        best_score >= 0.78 and
-        len(best_calls) >= max(1, expected_calls - 1)
-    ):
-        # Avoid stacking cloud latency on top of already-expensive local recovery
-        # when local quality is likely acceptable.
-        should_try_cloud = False
+    if should_try_cloud and total_local_time >= (local_time_budget_ms + 180):
+        # If local path already exceeded budget by a lot, only skip cloud when local
+        # is very likely sufficient.
+        if best_score >= 0.90 and final_ambiguity < 0.45 and len(best_calls) >= expected_calls:
+            should_try_cloud = False
     if should_try_cloud:
         try:
             cloud = generate_cloud(messages, tools)
@@ -1538,8 +1541,20 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
             return local
 
         cloud_calls = _sanitize_calls(cloud.get("function_calls", []), tools, user_text)
+        cloud_calls = _trim_calls(
+            cloud_calls,
+            tools,
+            user_text,
+            expected_calls,
+            preferred_tools=likely_tools,
+        )
         cloud_score = _score_local_candidate(cloud_calls, tools, user_text, 1.0, "")
-        if cloud_score >= best_score + 0.02:
+        accept_cloud = cloud_score >= (best_score + cloud_accept_margin)
+        if final_ambiguity >= cloud_ambiguity_high and cloud_calls:
+            accept_cloud = cloud_score >= (best_score - 0.03)
+        if len(best_calls) < expected_calls and len(cloud_calls) >= len(best_calls):
+            accept_cloud = accept_cloud or (cloud_score >= (best_score - 0.05))
+        if accept_cloud:
             cloud["function_calls"] = cloud_calls
             cloud["source"] = "cloud (fallback)"
             cloud["local_confidence"] = local_confidence
