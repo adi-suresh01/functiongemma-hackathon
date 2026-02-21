@@ -786,6 +786,108 @@ def _likely_tools_with_clauses(user_text, tools):
     return likely
 
 
+def _sorted_tool_scores(text, tools):
+    return sorted(
+        ((tool["name"], _tool_relevance(tool, text)) for tool in tools),
+        key=lambda x: x[1],
+        reverse=True,
+    )
+
+
+def _call_argument_blob(calls):
+    parts = []
+    for call in calls or []:
+        args = call.get("arguments", {})
+        if not isinstance(args, dict):
+            continue
+        for value in args.values():
+            if isinstance(value, str):
+                parts.append(value.lower())
+    return " ".join(parts)
+
+
+def _time_values_from_calls(calls):
+    values = []
+    for call in calls or []:
+        args = call.get("arguments", {})
+        if not isinstance(args, dict):
+            continue
+        for key, value in args.items():
+            key_l = str(key).lower()
+            if key_l in {"time", "when"} and value is not None:
+                normalized = _extract_time_text(str(value)) or str(value).strip()
+                values.append(str(normalized).lower())
+            elif key_l in {"hour", "minute"} and value is not None:
+                values.append(str(value).strip().lower())
+    return values
+
+
+def _ambiguity_score(user_text, tools, expected_calls, calls):
+    if not user_text or not tools:
+        return 0.0
+
+    score = 0.0
+
+    global_scores = _sorted_tool_scores(user_text, tools)
+    if len(global_scores) >= 2:
+        top_1 = global_scores[0][1]
+        top_2 = global_scores[1][1]
+        margin = top_1 - top_2
+        if top_1 <= 0:
+            score += 0.20
+        elif margin <= 0:
+            score += 0.35
+        elif margin <= 1:
+            score += 0.28
+        elif margin <= 2:
+            score += 0.15
+
+    ambiguous_clauses = 0
+    clauses = _split_clauses(user_text)
+    for clause in clauses:
+        clause_scores = _sorted_tool_scores(clause, tools)
+        if len(clause_scores) < 2:
+            continue
+        top_1 = clause_scores[0][1]
+        top_2 = clause_scores[1][1]
+        if top_1 <= 0:
+            continue
+        if top_2 >= (top_1 - 1):
+            ambiguous_clauses += 1
+    score += min(0.30, 0.12 * ambiguous_clauses)
+
+    pronouns = re.findall(r"\b(him|her|them|it|there|that|this)\b", user_text, flags=re.IGNORECASE)
+    if pronouns:
+        arg_blob = _call_argument_blob(calls)
+        unresolved = (not arg_blob) or any(
+            re.search(rf"\b{re.escape(pron.lower())}\b", arg_blob) is not None
+            for pron in pronouns
+        )
+        referents = [r.lower() for r in re.findall(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b", user_text)]
+        if referents and any(ref in arg_blob for ref in referents):
+            unresolved = False
+        if unresolved:
+            score += 0.15
+
+    user_times = [t.lower() for t in _extract_all_time_texts(user_text)]
+    call_times = _time_values_from_calls(calls)
+    if len(set(user_times)) >= 2 and call_times:
+        matched = any(ct in ut or ut in ct for ct in call_times for ut in user_times)
+        if not matched:
+            score += 0.15
+
+    if expected_calls >= 2:
+        unique_tool_calls = {c.get("name") for c in calls if isinstance(c, dict)}
+        if len(unique_tool_calls) < min(expected_calls, 2):
+            score += 0.18
+
+    if len(calls) < expected_calls:
+        gap = expected_calls - len(calls)
+        score += min(0.20, 0.10 * gap)
+
+    return max(0.0, min(1.0, score))
+
+
 def _call_quality(call, tools_by_name, user_text):
     name = call.get("name")
     if name not in tools_by_name:
@@ -971,6 +1073,7 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
         repaired_primary_calls = _sanitize_calls(primary.get("function_calls", []), tools, user_text)
         best_calls = _trim_calls(repaired_primary_calls, tools, user_text, expected_calls, preferred_tools=likely_tools)
         best_score = _score_local_candidate(best_calls, tools, user_text, local_confidence, primary_response)
+        current_ambiguity = _ambiguity_score(user_text, tools, expected_calls, best_calls)
         best_tool_names = {c.get("name") for c in best_calls}
         missing_likely = likely_tools - best_tool_names
 
@@ -978,7 +1081,8 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
             len(best_calls) == 0 or
             len(best_calls) < expected_calls or
             best_score < 0.72 or
-            bool(missing_likely)
+            bool(missing_likely) or
+            current_ambiguity >= 0.45
         )
 
         if need_clause_recovery and tools:
@@ -990,13 +1094,15 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
             if quick_score >= best_score:
                 best_calls = quick_merged
                 best_score = quick_score
+                current_ambiguity = _ambiguity_score(user_text, tools, expected_calls, best_calls)
                 best_tool_names = {c.get("name") for c in best_calls}
                 missing_likely = likely_tools - best_tool_names
                 need_clause_recovery = (
                     len(best_calls) == 0 or
                     len(best_calls) < expected_calls or
                     best_score < 0.72 or
-                    bool(missing_likely)
+                    bool(missing_likely) or
+                    current_ambiguity >= 0.45
                 )
 
         if need_clause_recovery and tools:
@@ -1032,10 +1138,16 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
             if merged_score > best_score:
                 best_calls = merged_calls
                 best_score = merged_score
+                current_ambiguity = _ambiguity_score(user_text, tools, expected_calls, best_calls)
 
         best_tool_names = {c.get("name") for c in best_calls}
         missing_likely = likely_tools - best_tool_names
-        if (len(best_calls) < expected_calls or best_score < 0.55 or bool(missing_likely)) and tools:
+        if (
+            len(best_calls) < expected_calls or
+            best_score < 0.55 or
+            bool(missing_likely) or
+            current_ambiguity >= 0.60
+        ) and tools:
             synthesized = _sanitize_calls(_synthesize_calls_from_text(user_text, tools), tools, user_text)
             merged_synth = _sanitize_calls(_merge_calls(best_calls, synthesized), tools, user_text)
             merged_synth = _trim_calls(merged_synth, tools, user_text, expected_calls, preferred_tools=likely_tools)
@@ -1043,6 +1155,7 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
             if synth_score >= best_score:
                 best_calls = merged_synth
                 best_score = synth_score
+                current_ambiguity = _ambiguity_score(user_text, tools, expected_calls, best_calls)
     finally:
         cactus_destroy(model)
 
@@ -1054,6 +1167,7 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
 
     best_tool_names = {c.get("name") for c in best_calls}
     missing_likely = likely_tools - best_tool_names
+    final_ambiguity = _ambiguity_score(user_text, tools, expected_calls, best_calls)
     risk = 0
     if len(best_calls) == 0:
         risk += 2
@@ -1067,12 +1181,42 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
         risk += 1
     if bool(missing_likely):
         risk += 1
+    if final_ambiguity >= 0.35:
+        risk += 1
+    if final_ambiguity >= 0.60:
+        risk += 1
     if local_confidence < min(0.85, confidence_threshold):
         risk += 1
     if _contains_refusal(primary_response) and not best_calls:
         risk += 1
 
-    should_try_cloud = bool(os.environ.get("GEMINI_API_KEY")) and risk >= 3
+    cloud_pressure = risk
+    if final_ambiguity >= 0.75 and best_score < 0.90:
+        cloud_pressure += 1
+    if expected_calls >= 3 and best_score < 0.85:
+        cloud_pressure += 1
+
+    local_bias = 0
+    if best_score >= 0.92 and len(best_calls) >= expected_calls:
+        local_bias += 2
+    elif best_score >= 0.82:
+        local_bias += 1
+    if local_confidence >= 0.95:
+        local_bias += 1
+    if total_local_time >= 500:
+        # Cloud fallback here is usually net-latency-negative.
+        local_bias += 1
+    if len(tools) <= 2 and expected_calls == 1 and best_score >= 0.70:
+        local_bias += 1
+
+    route_score = cloud_pressure - local_bias
+    cloud_threshold = 3
+    if expected_calls >= 3 or len(tools) >= 8:
+        cloud_threshold = 2
+    if final_ambiguity >= 0.70:
+        cloud_threshold -= 1
+
+    should_try_cloud = bool(os.environ.get("GEMINI_API_KEY")) and route_score >= cloud_threshold
     if should_try_cloud:
         try:
             cloud = generate_cloud(messages, tools)
