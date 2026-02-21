@@ -1050,6 +1050,13 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
     expected_calls = _estimate_intent_count(user_text, tools)
     likely_tools = _likely_tools_with_clauses(user_text, tools)
 
+    # Tunable routing knobs for hidden-eval iteration.
+    recovery_ambiguity_threshold = 0.45
+    synthesis_ambiguity_threshold = 0.60
+    cloud_ambiguity_low = 0.35
+    cloud_ambiguity_high = 0.60
+    cloud_ambiguity_extreme = 0.75
+
     total_local_time = 0
     local_confidence = 0.0
     primary_response = ""
@@ -1082,7 +1089,7 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
             len(best_calls) < expected_calls or
             best_score < 0.72 or
             bool(missing_likely) or
-            current_ambiguity >= 0.45
+            current_ambiguity >= recovery_ambiguity_threshold
         )
 
         if need_clause_recovery and tools:
@@ -1102,7 +1109,7 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
                     len(best_calls) < expected_calls or
                     best_score < 0.72 or
                     bool(missing_likely) or
-                    current_ambiguity >= 0.45
+                    current_ambiguity >= recovery_ambiguity_threshold
                 )
 
         if need_clause_recovery and tools:
@@ -1146,7 +1153,7 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
             len(best_calls) < expected_calls or
             best_score < 0.55 or
             bool(missing_likely) or
-            current_ambiguity >= 0.60
+            current_ambiguity >= synthesis_ambiguity_threshold
         ) and tools:
             synthesized = _sanitize_calls(_synthesize_calls_from_text(user_text, tools), tools, user_text)
             merged_synth = _sanitize_calls(_merge_calls(best_calls, synthesized), tools, user_text)
@@ -1181,9 +1188,9 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
         risk += 1
     if bool(missing_likely):
         risk += 1
-    if final_ambiguity >= 0.35:
+    if final_ambiguity >= cloud_ambiguity_low:
         risk += 1
-    if final_ambiguity >= 0.60:
+    if final_ambiguity >= cloud_ambiguity_high:
         risk += 1
     if local_confidence < min(0.85, confidence_threshold):
         risk += 1
@@ -1191,7 +1198,7 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
         risk += 1
 
     cloud_pressure = risk
-    if final_ambiguity >= 0.75 and best_score < 0.90:
+    if final_ambiguity >= cloud_ambiguity_extreme and best_score < 0.90:
         cloud_pressure += 1
     if expected_calls >= 3 and best_score < 0.85:
         cloud_pressure += 1
@@ -1213,7 +1220,7 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
     cloud_threshold = 3
     if expected_calls >= 3 or len(tools) >= 8:
         cloud_threshold = 2
-    if final_ambiguity >= 0.70:
+    if final_ambiguity >= max(cloud_ambiguity_high, 0.70):
         cloud_threshold -= 1
 
     should_try_cloud = bool(os.environ.get("GEMINI_API_KEY")) and route_score >= cloud_threshold
