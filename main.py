@@ -1214,6 +1214,11 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
     cloud_ambiguity_low = 0.35
     cloud_ambiguity_high = 0.60
     cloud_ambiguity_extreme = 0.75
+    local_time_budget_ms = 700
+    min_budget_for_extra_pass_ms = 120
+    clause_pass_budget_estimate_ms = 130
+    focused_max_tokens = 112
+    clause_max_tokens = 72
 
     total_local_time = 0
     local_confidence = 0.0
@@ -1224,7 +1229,7 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
 
     model = cactus_init(functiongemma_path)
     try:
-        primary_max_tokens = 192 if expected_calls <= 2 else 256
+        primary_max_tokens = 176 if expected_calls <= 2 else 224
         primary = _run_local_candidate_with_model(
             model,
             messages,
@@ -1243,7 +1248,7 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
         best_tool_names = {c.get("name") for c in best_calls}
         missing_likely = likely_tools - best_tool_names
 
-        need_clause_recovery = (
+        need_recovery_signal = (
             len(best_calls) == 0 or
             len(best_calls) < expected_calls or
             best_score < 0.72 or
@@ -1251,7 +1256,7 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
             current_ambiguity >= recovery_ambiguity_threshold
         )
 
-        if need_clause_recovery and tools:
+        if need_recovery_signal and tools:
             # Run deterministic synthesis before expensive extra local passes.
             quick_synth = _sanitize_calls(_synthesize_calls_from_text(user_text, tools), tools, user_text)
             quick_merged = _sanitize_calls(_merge_calls(best_calls, quick_synth), tools, user_text)
@@ -1263,7 +1268,7 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
                 current_ambiguity = _ambiguity_score(user_text, tools, expected_calls, best_calls)
                 best_tool_names = {c.get("name") for c in best_calls}
                 missing_likely = likely_tools - best_tool_names
-                need_clause_recovery = (
+                need_recovery_signal = (
                     len(best_calls) == 0 or
                     len(best_calls) < expected_calls or
                     best_score < 0.72 or
@@ -1302,7 +1307,7 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
                     )
                     best_tool_names = graph_tool_names
                     missing_likely = likely_tools - best_tool_names
-                    need_clause_recovery = (
+                    need_recovery_signal = (
                         len(best_calls) == 0 or
                         len(best_calls) < expected_calls or
                         best_score < 0.72 or
@@ -1310,7 +1315,8 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
                         current_ambiguity >= recovery_ambiguity_threshold
                     )
 
-        if need_clause_recovery and tools:
+        can_afford_extra_pass = (total_local_time + min_budget_for_extra_pass_ms) <= local_time_budget_ms
+        if need_recovery_signal and tools and can_afford_extra_pass:
             focused_tools = _select_relevant_tools(user_text, tools, likely_tools=likely_tools, expected_calls=expected_calls)
             if len(focused_tools) < len(tools):
                 focused_result = _run_local_candidate_with_model(
@@ -1322,7 +1328,7 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
                         "Use only the provided tools and return all needed function calls."
                     ),
                     tool_rag_top_k=0,
-                    max_tokens=160,
+                    max_tokens=focused_max_tokens,
                 )
                 total_local_time += focused_result.get("total_time_ms", 0) or 0
                 focused_calls = _sanitize_calls(focused_result.get("function_calls", []), focused_tools, user_text)
@@ -1350,7 +1356,7 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
                     current_ambiguity = _ambiguity_score(user_text, tools, expected_calls, best_calls)
                     best_tool_names = focused_tool_names
                     missing_likely = likely_tools - best_tool_names
-                    need_clause_recovery = (
+                    need_recovery_signal = (
                         len(best_calls) == 0 or
                         len(best_calls) < expected_calls or
                         best_score < 0.72 or
@@ -1358,10 +1364,16 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
                         current_ambiguity >= recovery_ambiguity_threshold
                     )
 
-        if need_clause_recovery and tools:
+        can_afford_extra_pass = (total_local_time + min_budget_for_extra_pass_ms) <= local_time_budget_ms
+        if need_recovery_signal and tools and can_afford_extra_pass:
             clause_calls = []
-            clause_limit = min(4, max(2, expected_calls + 1))
+            clause_limit = min(3, max(2, expected_calls))
+            remaining_budget_ms = max(0, local_time_budget_ms - total_local_time)
+            affordable_clause_passes = int(remaining_budget_ms // clause_pass_budget_estimate_ms)
+            clause_limit = min(clause_limit, affordable_clause_passes)
             for clause in _split_clauses(user_text)[:clause_limit]:
+                if (total_local_time + min_budget_for_extra_pass_ms) > local_time_budget_ms:
+                    break
                 clause_tools = _choose_clause_tools(clause, tools)
                 clause_messages = [{"role": "user", "content": clause}]
                 clause_result = _run_local_candidate_with_model(
@@ -1369,7 +1381,7 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
                     clause_messages,
                     clause_tools,
                     tool_rag_top_k=0,
-                    max_tokens=96,
+                    max_tokens=clause_max_tokens,
                 )
                 total_local_time += clause_result.get("total_time_ms", 0) or 0
                 clause_fixed = _sanitize_calls(clause_result.get("function_calls", []), clause_tools, clause)
@@ -1378,6 +1390,20 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
                 if clause_candidates:
                     # Each clause should usually map to one primary tool call.
                     clause_calls.append(clause_candidates[0])
+                    tentative_calls = _sanitize_calls(_merge_calls(best_calls, clause_calls), tools, user_text)
+                    tentative_calls = _trim_calls(
+                        tentative_calls,
+                        tools,
+                        user_text,
+                        expected_calls,
+                        preferred_tools=likely_tools,
+                    )
+                    tentative_tool_names = {c.get("name") for c in tentative_calls}
+                    tentative_missing = likely_tools - tentative_tool_names
+                    if len(tentative_calls) >= expected_calls and (
+                        not tentative_missing or len(tentative_tool_names) >= expected_calls
+                    ):
+                        break
 
             merged_calls = _sanitize_calls(_merge_calls(best_calls, clause_calls), tools, user_text)
             merged_calls = _trim_calls(merged_calls, tools, user_text, expected_calls, preferred_tools=likely_tools)
@@ -1468,7 +1494,9 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
         local_bias += 1
     if local_confidence >= 0.95:
         local_bias += 1
-    if total_local_time >= 500:
+    if total_local_time >= local_time_budget_ms:
+        local_bias += 2
+    elif total_local_time >= 500:
         # Cloud fallback here is usually net-latency-negative.
         local_bias += 1
     if len(tools) <= 2 and expected_calls == 1 and best_score >= 0.70:
@@ -1491,6 +1519,15 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
     cloud_threshold = max(1, cloud_threshold)
 
     should_try_cloud = bool(os.environ.get("GEMINI_API_KEY")) and route_score >= cloud_threshold
+    if (
+        should_try_cloud and
+        total_local_time >= local_time_budget_ms and
+        best_score >= 0.78 and
+        len(best_calls) >= max(1, expected_calls - 1)
+    ):
+        # Avoid stacking cloud latency on top of already-expensive local recovery
+        # when local quality is likely acceptable.
+        should_try_cloud = False
     if should_try_cloud:
         try:
             cloud = generate_cloud(messages, tools)
