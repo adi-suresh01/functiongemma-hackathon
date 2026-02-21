@@ -824,6 +824,126 @@ def _select_relevant_tools(user_text, tools, likely_tools=None, expected_calls=1
     return selected if selected else tools
 
 
+def _required_arg_ratio(tool, clause_text, user_text):
+    properties, required = _tool_schema(tool)
+    if not required:
+        return 1.0
+
+    hits = 0
+    tool_name = tool.get("name", "")
+    for key in required:
+        arg_type = properties.get(key, {}).get("type", "string")
+        value = _infer_argument(key, arg_type, clause_text, tool_name)
+        if value is None:
+            value = _infer_argument(key, arg_type, user_text, tool_name)
+        if value is None:
+            continue
+        coerced = _coerce_argument(value, arg_type, key, user_text)
+        if coerced is not None and coerced != "":
+            hits += 1
+    return hits / len(required)
+
+
+def _graph_route_calls(user_text, tools, expected_calls):
+    if not user_text or not tools:
+        return [], {"ambiguity": 0.0, "avg_margin": 0.0, "low_margin_ratio": 0.0}
+
+    clauses = _split_clauses(user_text)
+    if not clauses:
+        clauses = [user_text]
+
+    # Keep graph pass lightweight even on long prompts.
+    clauses = clauses[: max(2, min(6, expected_calls + 2))]
+    tools_by_name = {t["name"]: t for t in tools}
+
+    used_counts = {}
+    assignments = []
+    margins = []
+
+    for clause in clauses:
+        scored = []
+        for tool in tools:
+            clause_rel = _tool_relevance(tool, clause)
+            global_rel = _tool_relevance(tool, user_text)
+            req_ratio = _required_arg_ratio(tool, clause, user_text)
+            reuse_penalty = 0.9 * used_counts.get(tool.get("name"), 0)
+            edge_score = (2.0 * clause_rel) + (0.35 * global_rel) + (2.8 * req_ratio) - reuse_penalty
+            scored.append((edge_score, tool))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        if not scored:
+            continue
+
+        best_score, best_tool = scored[0]
+        second_score = scored[1][0] if len(scored) > 1 else 0.0
+        margin = best_score - second_score
+        margins.append(margin)
+
+        if best_score <= 0.6:
+            continue
+
+        assignments.append({
+            "clause": clause,
+            "tool_name": best_tool.get("name"),
+            "score": best_score,
+            "margin": margin,
+        })
+        used_counts[best_tool.get("name")] = used_counts.get(best_tool.get("name"), 0) + 1
+
+    candidate_calls = []
+    for item in assignments:
+        tool_name = item.get("tool_name")
+        tool = tools_by_name.get(tool_name)
+        if not tool:
+            continue
+        clause = item.get("clause", "")
+
+        clause_calls = _sanitize_calls(
+            _synthesize_calls_from_text(clause, [tool]),
+            [tool],
+            clause,
+        )
+        if clause_calls:
+            candidate_calls.append(clause_calls[0])
+            continue
+
+        # Fallback to global prompt for pronoun-heavy clauses.
+        global_calls = _sanitize_calls(
+            _synthesize_calls_from_text(user_text, [tool]),
+            [tool],
+            user_text,
+        )
+        if global_calls:
+            candidate_calls.append(global_calls[0])
+
+    candidate_calls = _sanitize_calls(candidate_calls, tools, user_text)
+
+    avg_margin = (sum(margins) / len(margins)) if margins else 0.0
+    low_margin_ratio = (
+        sum(1 for m in margins if m < 1.2) / len(margins)
+        if margins else 0.0
+    )
+
+    ambiguity = 0.0
+    if low_margin_ratio >= 0.60:
+        ambiguity += 0.35
+    elif low_margin_ratio >= 0.35:
+        ambiguity += 0.18
+    if avg_margin <= 0.8:
+        ambiguity += 0.25
+    elif avg_margin <= 1.5:
+        ambiguity += 0.12
+    if len(candidate_calls) < min(expected_calls, len(tools)):
+        ambiguity += 0.15
+    ambiguity = max(0.0, min(1.0, ambiguity))
+
+    return candidate_calls, {
+        "ambiguity": ambiguity,
+        "avg_margin": avg_margin,
+        "low_margin_ratio": low_margin_ratio,
+    }
+
+
 def _sorted_tool_scores(text, tools):
     return sorted(
         ((tool["name"], _tool_relevance(tool, text)) for tool in tools),
