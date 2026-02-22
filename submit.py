@@ -28,9 +28,11 @@ def submit(team, location):
                 timeout=15,
             )
     except requests.exceptions.ConnectionError:
+        print("error1")
         print("The Leaderboard is not accepting submissions at this time.")
         return
     except requests.exceptions.Timeout:
+        print("error1")
         print("The Leaderboard is not accepting submissions at this time.")
         return
 
@@ -38,6 +40,7 @@ def submit(team, location):
         try:
             msg = resp.json().get("error", resp.text)
         except (requests.exceptions.JSONDecodeError, ValueError):
+            print("error1")
             print("The Leaderboard is not accepting submissions at this time.")
             return
         print(f"Error: {msg}")

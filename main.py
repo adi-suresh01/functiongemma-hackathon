@@ -470,6 +470,22 @@ def _coerce_argument(value, arg_type, key, user_text):
         if re.search(r"\b\d{1,2}:\d{2}\b", value_s):
             inferred = _extract_time_text(user_text)
             return inferred if inferred is not None else None
+        explicit_user_time = _extract_time_text(user_text)
+        if explicit_user_time:
+            value_l = value_s.lower()
+            time_like = bool(re.search(r"(?:\d{1,2}:\d{2})|(?:\b\d{1,2}\s*(?:am|pm)\b)", value_s, flags=re.IGNORECASE))
+            natural_like = bool(
+                re.search(
+                    r"\b(morning|afternoon|evening|tonight|tomorrow|today|noon|midnight)\b",
+                    value_l,
+                )
+            )
+            matches_explicit = (
+                explicit_user_time.lower() in value_l or
+                value_l in explicit_user_time.lower()
+            )
+            if not matches_explicit and not time_like and not natural_like:
+                return explicit_user_time
         return value_s
 
     return str(value).strip()
@@ -536,10 +552,29 @@ def _sanitize_calls(calls, tools, user_text):
                     inferred_clean = _clean_span(inferred_str)
                     if key_l == "time":
                         current_clean = _clean_span(current_val)
+                        explicit_user_time = _extract_time_text(user_text)
+                        current_time_like = bool(
+                            re.search(
+                                r"(?:\d{1,2}:\d{2})|(?:\b\d{1,2}\s*(?:am|pm)\b)",
+                                current_clean,
+                                flags=re.IGNORECASE,
+                            )
+                        )
+                        current_natural_like = bool(
+                            re.search(
+                                r"\b(morning|afternoon|evening|tonight|tomorrow|today|noon|midnight)\b",
+                                current_clean.lower(),
+                            )
+                        )
                         suspicious_time = (
                             not current_clean or
                             re.search(r"\d{4}-\d{2}-\d{2}", current_clean) is not None or
-                            re.search(r"\d{1,2}h\d{2}", current_clean.lower()) is not None
+                            re.search(r"\d{1,2}h\d{2}", current_clean.lower()) is not None or
+                            (
+                                explicit_user_time is not None and
+                                not current_time_like and
+                                not current_natural_like
+                            )
                         )
                         time_mentions = _extract_all_time_texts(user_text)
                         if suspicious_time or len(time_mentions) == 1:
@@ -729,12 +764,14 @@ def _score_local_candidate(calls, tools, user_text, confidence=0.0, response="")
     valid_calls = 0
     required_total = 0
     required_hit = 0
+    valid_tool_names = []
 
     for call in calls:
         name = call.get("name")
         if name not in tools_by_name:
             continue
         valid_calls += 1
+        valid_tool_names.append(name)
         properties, required = _tool_schema(tools_by_name[name])
         required_total += len(required)
         args = call.get("arguments", {})
@@ -748,16 +785,24 @@ def _score_local_candidate(calls, tools, user_text, confidence=0.0, response="")
     required_ratio = (required_hit / required_total) if required_total else (1.0 if calls else 0.0)
     expected = _estimate_intent_count(user_text, tools)
     coverage = min(len(calls), expected) / max(1, expected)
+    unique_tool_count = len(set(valid_tool_names))
+    unique_coverage = min(unique_tool_count, expected) / max(1, expected)
     overflow_penalty = max(0, len(calls) - expected) * 0.15
+    duplicate_penalty = 0.0
+    if expected >= 2:
+        duplicate_count = max(0, valid_calls - unique_tool_count)
+        duplicate_penalty = min(0.25, 0.12 * duplicate_count)
     refusal_penalty = 0.20 if _contains_refusal(response) and not calls else 0.0
     conf = max(0.0, min(1.0, float(confidence or 0.0)))
 
     score = (
-        0.35 * valid_ratio +
-        0.25 * required_ratio +
-        0.25 * coverage +
-        0.15 * conf -
+        0.30 * valid_ratio +
+        0.23 * required_ratio +
+        0.18 * coverage +
+        0.17 * unique_coverage +
+        0.12 * conf -
         overflow_penalty -
+        duplicate_penalty -
         refusal_penalty
     )
     return max(0.0, min(1.0, score))
@@ -829,19 +874,35 @@ def _required_arg_ratio(tool, clause_text, user_text):
     if not required:
         return 1.0
 
-    hits = 0
+    clause_hits = 0
+    global_hits = 0
     tool_name = tool.get("name", "")
     for key in required:
         arg_type = properties.get(key, {}).get("type", "string")
-        value = _infer_argument(key, arg_type, clause_text, tool_name)
-        if value is None:
-            value = _infer_argument(key, arg_type, user_text, tool_name)
-        if value is None:
+        clause_value = _infer_argument(key, arg_type, clause_text, tool_name)
+        clause_coerced = (
+            _coerce_argument(clause_value, arg_type, key, user_text)
+            if clause_value is not None else None
+        )
+        if clause_coerced is not None and clause_coerced != "":
+            clause_hits += 1
             continue
-        coerced = _coerce_argument(value, arg_type, key, user_text)
-        if coerced is not None and coerced != "":
-            hits += 1
-    return hits / len(required)
+
+        global_value = _infer_argument(key, arg_type, user_text, tool_name)
+        global_coerced = (
+            _coerce_argument(global_value, arg_type, key, user_text)
+            if global_value is not None else None
+        )
+        if global_coerced is not None and global_coerced != "":
+            global_hits += 1
+
+    clause_ratio = clause_hits / len(required)
+    global_ratio = global_hits / len(required)
+
+    # Prefer clause-local extractability; prompt-level fallback is weaker signal.
+    if clause_ratio > 0:
+        return min(1.0, clause_ratio + (0.20 * global_ratio))
+    return 0.35 * global_ratio
 
 
 def _graph_route_calls(user_text, tools, expected_calls):
@@ -866,7 +927,7 @@ def _graph_route_calls(user_text, tools, expected_calls):
             clause_rel = _tool_relevance(tool, clause)
             global_rel = _tool_relevance(tool, user_text)
             req_ratio = _required_arg_ratio(tool, clause, user_text)
-            reuse_penalty = 0.9 * used_counts.get(tool.get("name"), 0)
+            reuse_penalty = 1.20 * used_counts.get(tool.get("name"), 0)
             edge_score = (2.0 * clause_rel) + (0.35 * global_rel) + (2.8 * req_ratio) - reuse_penalty
             scored.append((edge_score, tool))
 
@@ -1389,8 +1450,41 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
                 clause_synth = _sanitize_calls(_synthesize_calls_from_text(clause, clause_tools), clause_tools, clause)
                 clause_candidates = _sanitize_calls(_merge_calls(clause_fixed, clause_synth), clause_tools, clause)
                 if clause_candidates:
-                    # Each clause should usually map to one primary tool call.
-                    clause_calls.append(clause_candidates[0])
+                    # Pick the clause candidate that improves global coverage/score the most.
+                    chosen = None
+                    chosen_score = float("-inf")
+                    seen_tools = {c.get("name") for c in (best_calls + clause_calls)}
+                    for candidate in clause_candidates:
+                        tentative_calls = _sanitize_calls(
+                            _merge_calls(best_calls, clause_calls + [candidate]),
+                            tools,
+                            user_text,
+                        )
+                        tentative_calls = _trim_calls(
+                            tentative_calls,
+                            tools,
+                            user_text,
+                            expected_calls,
+                            preferred_tools=likely_tools,
+                        )
+                        tentative_score = _score_local_candidate(
+                            tentative_calls,
+                            tools,
+                            user_text,
+                            local_confidence,
+                            primary_response,
+                        )
+                        tool_name = candidate.get("name")
+                        tool_obj = next((t for t in tools if t.get("name") == tool_name), None)
+                        clause_relevance_bonus = 0.03 * _tool_relevance(tool_obj, clause) if tool_obj else 0.0
+                        diversity_bonus = 0.20 if (expected_calls >= 2 and tool_name not in seen_tools) else 0.0
+                        combined_score = tentative_score + clause_relevance_bonus + diversity_bonus
+                        if combined_score > chosen_score:
+                            chosen = candidate
+                            chosen_score = combined_score
+
+                    if chosen is not None:
+                        clause_calls.append(chosen)
                     tentative_calls = _sanitize_calls(_merge_calls(best_calls, clause_calls), tools, user_text)
                     tentative_calls = _trim_calls(
                         tentative_calls,
